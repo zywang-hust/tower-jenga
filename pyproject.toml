@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jenga-tower"
+version = "0.1.0"
+description = "pi0.5 policy, local simulator and serving code for the TOWER bimanual Jenga challenge"
+requires-python = ">=3.11,<3.12"
+license = "Apache-2.0"
+# The runtime (JAX, OpenPI, torch, opencv, websockets, ...) comes from the pinned OpenPI lockfile installed by
+# scripts/bootstrap.sh; only what that lock lacks or what must match it exactly is listed here.
+dependencies = [
+    "numpy==1.26.4",
+    "h5py==3.13.0",
+    "google-crc32c==1.7.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5", "ruff==0.11.12"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jenga"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]  # this checkout's jenga, ahead of any other editable install
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = ["external"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/jenga/orient.py" = ["E702"]  # serving code, kept byte-identical to the served version
+

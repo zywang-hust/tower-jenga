@@ -1,0 +1,390 @@
+diff --git a/scripts/train.py b/scripts/train.py
+index 5d28941..4f73f9f 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -28,6 +28,10 @@ import openpi.training.utils as training_utils
+ import openpi.training.weight_loaders as _weight_loaders
+ 
+ 
++# Gradient accumulation: the global batch is processed as this many equal microbatches per optimizer step.
++GRAD_ACCUM_STEPS = 1
++
++
+ def init_logging():
+     """Custom logging format for better readability."""
+     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
+@@ -155,7 +159,24 @@ def train_step(
+ 
+     # Filter out frozen params.
+     diff_state = nnx.DiffState(0, config.trainable_filter)
+-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
++    if GRAD_ACCUM_STEPS == 1:
++        loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
++    else:
++        # Equal-size microbatches, so the mean of microbatch losses/grads is the full-batch mean. Rows are taken
++        # interleaved (every n-th) so each microbatch stays evenly spread over the data-parallel devices. Each
++        # microbatch draws its own flow-matching noise/time via fold_in (statistically, not bitwise, equivalent).
++        n = GRAD_ACCUM_STEPS
++        loss, grads = 0.0, None
++        for i in range(n):
++            micro = jax.tree.map(lambda x, i=i: x.reshape(x.shape[0] // n, n, *x.shape[1:])[:, i], (observation, actions))
++            micro = sharding.activation_sharding_constraint(micro)
++            micro_loss, micro_grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
++                model, jax.random.fold_in(train_rng, i), *micro
++            )
++            loss = loss + micro_loss / n
++            grads = jax.tree.map(lambda g: g / n, micro_grads) if grads is None else jax.tree.map(
++                lambda acc, g: acc + g / n, grads, micro_grads
++            )
+ 
+     params = state.params.filter(config.trainable_filter)
+     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+diff --git a/src/openpi/models/gemma.py b/src/openpi/models/gemma.py
+index d1623d1..857a63a 100644
+--- a/src/openpi/models/gemma.py
++++ b/src/openpi/models/gemma.py
+@@ -154,6 +154,15 @@ class Embedder(nn.Module):
+         return jnp.dot(x, self.input_embedding_table.T)
+ 
+ 
++
++# jax.checkpoint_policies name for the remat'd transformer blocks. Only changes what is stored vs recomputed.
++REMAT_POLICY = "nothing_saveable"
++# Layer-scan unroll factor. Same computation; larger values let XLA schedule across layers.
++SCAN_UNROLL = 1
++
++# Single-KV-head attention in dot_general's natural layout (see Attention). Numerically the same computation.
++ATTENTION_NATURAL_LAYOUT = False
++
+ @at.typecheck
+ class Attention(nn.Module):
+     """Attention module."""
+@@ -199,6 +208,7 @@ class Attention(nn.Module):
+                 qkvs.append((q, k, v))
+ 
+         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
++        q, k, v = sharding.activation_sharding_constraint((q, k, v))
+ 
+         q = _apply_rope(q, positions=positions)
+         q *= self.configs[0].head_dim ** -0.5
+@@ -213,9 +223,6 @@ class Attention(nn.Module):
+             k = jnp.concatenate([cache_k, k], axis=1)
+             v = jnp.concatenate([cache_v, v], axis=1)
+ 
+-        q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
+-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+-
+         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
+             raise ValueError(
+                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
+@@ -223,12 +230,21 @@ class Attention(nn.Module):
+ 
+         # big_neg = jnp.finfo(logits.dtype).min
+         big_neg = -2.3819763e38  # See gemma/modules.py
+-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+-
+-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+ 
+-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+-        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
++        if ATTENTION_NATURAL_LAYOUT and self.configs[0].num_kv_heads == 1:
++            # Same math as below with the single KV head squeezed out. Both einsums then produce dot_general's
++            # natural output layout, so XLA does not transpose the (T, heads, S) logits and probabilities.
++            logits = jnp.einsum("BTGH,BSH->BTGS", q, k[:, :, 0], preferred_element_type=jnp.float32)
++            masked_logits = jnp.where(attn_mask[:, 0, :, None, :], logits, big_neg)
++            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
++            encoded = jnp.einsum("BTGS,BSH->BTGH", probs, v[:, :, 0])
++        else:
++            q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
++            logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
++            masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
++            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
++            encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
++            encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+ 
+         out = []
+         start = 0
+@@ -304,6 +320,7 @@ class Block(nn.Module):
+             pre_attn.append(x)
+             gates.append(gate if x is not None else None)
+ 
++        gates = sharding.activation_sharding_constraint(gates)
+         pre_attn = sharding.activation_sharding_constraint(pre_attn)
+         post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
+@@ -325,6 +342,7 @@ class Block(nn.Module):
+             out.append(x)
+             gates.append(gate if x is not None else None)
+ 
++        gates = sharding.activation_sharding_constraint(gates)
+         out = sharding.activation_sharding_constraint(out)
+         out = jax.tree.map(lambda x: drop(x, deterministic), out)
+         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
+@@ -360,7 +378,7 @@ class Module(nn.Module):
+             Block,
+             prevent_cse=False,
+             static_argnums=(5,),  # 0=self, 6=deterministic
+-            policy=jax.checkpoint_policies.nothing_saveable,
++            policy=getattr(jax.checkpoint_policies, REMAT_POLICY),
+         )
+         self.layers = nn.scan(
+             block_cls,
+@@ -374,6 +392,7 @@ class Module(nn.Module):
+                 nn.broadcast,
+             ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+             length=self.configs[0].depth,
++            unroll=SCAN_UNROLL,
+         )(
+             configs=self.configs,
+             dropout=self.dropout,
+diff --git a/src/openpi/models/lora.py b/src/openpi/models/lora.py
+index 3dfff5b..383829c 100644
+--- a/src/openpi/models/lora.py
++++ b/src/openpi/models/lora.py
+@@ -6,6 +6,7 @@ import flax.struct as struct
+ import jax.numpy as jnp
+ 
+ import openpi.shared.array_typing as at
++import openpi.training.sharding as sharding
+ 
+ 
+ @struct.dataclass
+@@ -128,6 +129,10 @@ class FeedForward(nn.Module):
+             self.w_gating[0],
+             None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+         )
++        # Keep the wide MLP activations batch-sharded. Without these constraints the SPMD partitioner may compute
++        # them sharded on the hidden dim against FSDP-sharded weights and reshard with all-to-all, which fails at
++        # runtime when the activations are saved for backward (non-default remat policies).
++        ff_gate = sharding.activation_sharding_constraint(ff_gate)
+         gate_value = nn.gelu(ff_gate)
+ 
+         ff1 = self._dot(
+@@ -135,7 +140,8 @@ class FeedForward(nn.Module):
+             self.w_gating[1],
+             None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+         )
+-        activations = gate_value * ff1
++        ff1 = sharding.activation_sharding_constraint(ff1)
++        activations = sharding.activation_sharding_constraint(gate_value * ff1)
+ 
+         outputs = self._dot(activations, self.w_linear, self.w_linear_lora)
+         assert outputs.dtype == dtype
+diff --git a/src/openpi/models/model.py b/src/openpi/models/model.py
+index 29618b4..e7ac60e 100644
+--- a/src/openpi/models/model.py
++++ b/src/openpi/models/model.py
+@@ -148,6 +148,7 @@ def preprocess_observation(
+     train: bool = False,
+     image_keys: Sequence[str] = IMAGE_KEYS,
+     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
++    geometry_augment: bool = True,
+ ) -> Observation:
+     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
+     filling in a default image mask (if necessary).
+@@ -170,7 +171,7 @@ def preprocess_observation(
+             image = image / 2.0 + 0.5
+ 
+             transforms = []
+-            if "wrist" not in key:
++            if geometry_augment and "wrist" not in key:
+                 height, width = image.shape[1:3]
+                 transforms += [
+                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+index ae7c459..d06fd1b 100644
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -15,6 +15,9 @@ from openpi.shared import array_typing as at
+ 
+ logger = logging.getLogger("openpi")
+ 
++# Encode all camera views in one SigLIP call (numerically equivalent to per-view calls).
++BATCH_IMAGE_VIEWS = True
++
+ 
+ def make_attn_mask(input_mask, mask_ar):
+     """Adapted from big_vision.
+@@ -67,6 +70,8 @@ class Pi0(_model.BaseModel):
+     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+         self.pi05 = config.pi05
++        self.image_keys = config.image_keys
++        self.image_geometry_augment = config.image_geometry_augment
+         paligemma_config = _gemma.get_config(config.paligemma_variant)
+         action_expert_config = _gemma.get_config(config.action_expert_variant)
+         # TODO: rewrite gemma in NNX. For now, use bridge.
+@@ -91,6 +96,11 @@ class Pi0(_model.BaseModel):
+         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+         if config.pi05:
++            self.continuous_state = config.continuous_state
++            if config.continuous_state:
++                self.state_proj = nnx.Linear(2 * config.action_dim, action_expert_config.width,
++                                             kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros,
++                                             rngs=rngs)
+             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+         else:
+@@ -110,9 +120,21 @@ class Pi0(_model.BaseModel):
+         ar_mask = []
+         tokens = []
+         # embed images
+-        for name in obs.images:
+-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+-
++        names = list(obs.images)
++        shapes = {obs.images[name].shape for name in names}
++        if BATCH_IMAGE_VIEWS and len(names) > 1 and len(shapes) == 1:
++            # One SigLIP call over all views stacked on the batch axis. Images are encoded independently,
++            # so this equals per-view calls while launching far fewer, larger kernels.
++            # Views go on axis 1 so each sample's images stay on the device that holds the sample.
++            batch = obs.images[names[0]].shape[0]
++            stacked = jnp.stack([obs.images[name] for name in names], axis=1)
++            stacked = stacked.reshape(batch * len(names), *stacked.shape[2:])
++            encoded, _ = self.PaliGemma.img(stacked, train=False)
++            encoded = encoded.reshape(batch, len(names), *encoded.shape[1:])
++            per_view = [encoded[:, i] for i in range(len(names))]
++        else:
++            per_view = [self.PaliGemma.img(obs.images[name], train=False)[0] for name in names]
++        for name, image_tokens in zip(names, per_view, strict=True):
+             tokens.append(image_tokens)
+             input_mask.append(
+                 einops.repeat(
+@@ -157,6 +179,11 @@ class Pi0(_model.BaseModel):
+             ar_mask += [True]
+ 
+         action_tokens = self.action_in_proj(noisy_actions)
++        if self.pi05 and self.continuous_state:
++            # The discrete state token is floor((s + 1) * 128); give the expert the full value and the in-bin residual.
++            scaled = (jnp.clip(obs.state, -1.0, 1.0 - 1e-6) + 1.0) * 128.0
++            features = jnp.concatenate([obs.state, scaled - jnp.floor(scaled)], axis=-1)
++            action_tokens = action_tokens + self.state_proj(features)[:, None, :]
+         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+         if self.pi05:
+@@ -190,7 +217,10 @@ class Pi0(_model.BaseModel):
+         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+     ) -> at.Float[at.Array, "*b ah"]:
+         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
++        observation = _model.preprocess_observation(
++            preprocess_rng, observation, train=train, image_keys=self.image_keys,
++            geometry_augment=self.image_geometry_augment,
++        )
+ 
+         batch_shape = actions.shape[:-2]
+         noise = jax.random.normal(noise_rng, actions.shape)
+@@ -222,7 +252,7 @@ class Pi0(_model.BaseModel):
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
+     ) -> _model.Actions:
+-        observation = _model.preprocess_observation(None, observation, train=False)
++        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self.image_keys)
+         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
+         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
+         dt = -1.0 / num_steps
+diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
+index 584d83f..56b212d 100644
+--- a/src/openpi/models/pi0_config.py
++++ b/src/openpi/models/pi0_config.py
+@@ -24,6 +24,8 @@ class Pi0Config(_model.BaseModelConfig):
+     # Set the model specific defaults.
+     action_dim: int = 32
+     action_horizon: int = 50
++    # Preserve the pretrained defaults; downstream tasks may supply additional views.
++    image_keys: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+     max_token_len: int = None  # type: ignore
+     # Pi05 has two differences from Pi0:
+     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
+@@ -33,8 +35,21 @@ class Pi0Config(_model.BaseModelConfig):
+     discrete_state_input: bool = None  # type: ignore
+ 
+     pytorch_compile_mode: str | None = "max-autotune"
++    # Train-time random crop/resize/rotate on non-wrist views. Off when camera poses are fixed and the policy
++    # must stay sensitive to where objects appear in the image.
++    image_geometry_augment: bool = True
++    # pi05 only: also feed the continuous state, plus its position inside the 256-bin discrete state token, to the
++    # action expert (added to every action token). Zero-initialized, so a checkpoint without it is reproduced exactly.
++    continuous_state: bool = False
+ 
+     def __post_init__(self):
++        if isinstance(self.image_keys, str) or not self.image_keys:
++            raise ValueError("image_keys must be a non-empty sequence of camera names")
++        if any(not isinstance(key, str) or not key.strip() for key in self.image_keys):
++            raise ValueError("image_keys must contain non-empty strings")
++        if len(set(self.image_keys)) != len(self.image_keys):
++            raise ValueError("image_keys must be unique")
++        object.__setattr__(self, "image_keys", tuple(self.image_keys))
+         if self.max_token_len is None:
+             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+         if self.discrete_state_input is None:
+@@ -67,16 +82,8 @@ class Pi0Config(_model.BaseModelConfig):
+ 
+         with at.disable_typechecking():
+             observation_spec = _model.Observation(
+-                images={
+-                    "base_0_rgb": image_spec,
+-                    "left_wrist_0_rgb": image_spec,
+-                    "right_wrist_0_rgb": image_spec,
+-                },
+-                image_masks={
+-                    "base_0_rgb": image_mask_spec,
+-                    "left_wrist_0_rgb": image_mask_spec,
+-                    "right_wrist_0_rgb": image_mask_spec,
+-                },
++                images={key: image_spec for key in self.image_keys},
++                image_masks={key: image_mask_spec for key in self.image_keys},
+                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+diff --git a/src/openpi/models/siglip.py b/src/openpi/models/siglip.py
+index c74c99e..b28b7dd 100644
+--- a/src/openpi/models/siglip.py
++++ b/src/openpi/models/siglip.py
+@@ -23,6 +23,20 @@ import numpy as np
+ 
+ import openpi.training.sharding as sharding
+ 
++# None keeps flax's einsum attention (softmax in the compute dtype). "cudnn" uses the fused cuDNN kernel, which
++# computes the same unmasked softmax attention with f32 softmax; it needs libnvrtc.so.12 on the loader path.
++ATTENTION_IMPL: str | None = None
++# Overrides the encoder's remat_policy field when set. Only changes what is stored vs recomputed.
++REMAT_POLICY: str | None = None
++# Layer-scan unroll factor. Same computation; larger values let XLA schedule across layers.
++SCAN_UNROLL = 1
++
++
++def _fused_attention(query, key, value, bias=None, mask=None, *, dropout_rate=0.0, deterministic=True, **_):
++    if bias is not None or mask is not None or (dropout_rate > 0 and not deterministic):
++        raise ValueError("fused SigLIP attention supports only unmasked, dropout-free attention")
++    return jax.nn.dot_product_attention(query, key, value, implementation=ATTENTION_IMPL)
++
+ 
+ def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
+     """Follows the MoCo v3 logic."""
+@@ -90,6 +104,7 @@ class Encoder1DBlock(nn.Module):
+             kernel_init=nn.initializers.xavier_uniform(),
+             deterministic=deterministic,
+             dtype=self.dtype_mm,
++            **({"attention_fn": _fused_attention} if ATTENTION_IMPL else {}),
+         )(y, y)
+         y = sharding.activation_sharding_constraint(y)
+         y = nn.Dropout(rate=self.dropout)(y, deterministic)
+@@ -128,7 +143,7 @@ class Encoder(nn.Module):
+                 Encoder1DBlock,
+                 prevent_cse=False,
+                 static_argnums=(2,),  # 0=self, 2=deterministic
+-                policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
++                policy=getattr(jax.checkpoint_policies, REMAT_POLICY or self.remat_policy, None),
+             )
+             x, scan_out = nn.scan(
+                 block,
+@@ -136,6 +151,7 @@ class Encoder(nn.Module):
+                 split_rngs={"params": True, "dropout": True},
+                 in_axes=nn.broadcast,
+                 length=self.depth,
++                unroll=SCAN_UNROLL,
+             )(
+                 name="encoderblock",
+                 dtype_mm=self.dtype_mm,

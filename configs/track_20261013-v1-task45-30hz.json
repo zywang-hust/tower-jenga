@@ -1,0 +1,129 @@
+{
+ "id": "tower-sim-all",
+ "version": "20261013-v1-task45-30hz-reconnect",
+ "policy_track_version": "20261013-task45-v1",
+ "title": "TOWER Simulation",
+ "tower_git_sha": "e7fa4fb970ecfa86610638226a821a51f92759bd",
+ "runtime_identity": "sha256:0fcb689c7d1320f880378fccbf0bfa2763bbba2be9db54ce4b3450d648d7c91d",
+ "scorer_identity": "sha256:8708a22d5edb521d7983a9f3dd6120f9beda6b741e91e3c9102e1f197a8be5bc",
+ "variants": [
+  {
+   "id": "task1-2_tower_transfer_2",
+   "episodes": 10,
+   "instruction": "Use both arms cooperatively to transfer the Jenga tower to the designated target position."
+  },
+  {
+   "id": "task1-3_tower_transfer_3",
+   "episodes": 10,
+   "instruction": "Use both arms cooperatively to transfer the Jenga tower to the designated target position."
+  },
+  {
+   "id": "task2-2_cross_tower_transfer_2",
+   "episodes": 10,
+   "instruction": "Use both arms cooperatively to transfer the cross-shaped Jenga tower to the designated target position."
+  },
+  {
+   "id": "task2-3_cross_tower_transfer_3",
+   "episodes": 10,
+   "instruction": "Use both arms cooperatively to transfer the cross-shaped Jenga tower to the designated target position."
+  },
+  {
+   "id": "task3-2_vertical_stacking_2",
+   "episodes": 10,
+   "instruction": "Use both arms cooperatively to stack the Jenga blocks vertically at the designated target position."
+  },
+  {
+   "id": "task3-3_vertical_stacking_3",
+   "episodes": 10,
+   "instruction": "Use both arms cooperatively to stack the Jenga blocks vertically at the designated target position."
+  },
+  {
+   "id": "task4-2_full_tower_pushdown_2",
+   "episodes": 10,
+   "instruction": "Push the designated block from the full-layer Jenga tower while preserving the required tower structure."
+  },
+  {
+   "id": "task4-3_full_tower_pushdown_3",
+   "episodes": 10,
+   "instruction": "Push the designated block from the full-layer Jenga tower while preserving the required tower structure."
+  },
+  {
+   "id": "task5-2_tower_insertion_2",
+   "episodes": 10,
+   "instruction": "Use both arms to insert a block into the designated empty slot of the two-block Jenga tower."
+  },
+  {
+   "id": "task5-3_tower_insertion_3",
+   "episodes": 10,
+   "instruction": "Use both arms to insert a block into the designated empty slot of the two-block Jenga tower."
+  }
+ ],
+ "observation_schema": "tower-challenge-observation-v1",
+ "action_schema": "tower-challenge-joint16-v1",
+ "cameras": {
+  "left_back_camera": [
+   480,
+   640
+  ],
+  "back_wrist_camera": [
+   480,
+   640
+  ],
+  "left_wrist_camera": [
+   480,
+   640
+  ],
+  "right_front_camera": [
+   480,
+   640
+  ]
+ },
+ "action_dt_s": 0.03333333333333333,
+ "max_chunk_actions": 16,
+ "action_lower": [
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  0.0,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  -6.2832,
+  0.0
+ ],
+ "action_upper": [
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  0.10000000149011612,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  6.2832,
+  0.10000000149011612
+ ],
+ "inference_timeout_s": 180.0,
+ "episode_wall_timeout_s": 21600.0,
+ "simulation_limit_s": 210.0,
+ "infrastructure_retries": 0,
+ "official": true,
+ "metric_protocol": "tower-paper-v1",
+ "evaluation_protocol": "tower-robustness-v1",
+ "scene_manifest_identity": "sha256:5d4b44ca0f961b74256b428f30bb6fa32374f43d53347dfca5b0359730394e2a",
+ "policy_seed_mode": "fixed",
+ "access": "public"
+}

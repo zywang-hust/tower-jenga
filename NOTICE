@@ -1,0 +1,14 @@
+TOWER Jenga
+Copyright 2026 Team wzyfromhust
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+patches/openpi-tower.patch modifies OpenPI (https://github.com/Physical-Intelligence/openpi),
+Copyright Physical Intelligence, licensed under the Apache License, Version 2.0.
+
+The model weights are not part of this repository. They are a Model Derivative of Gemma and are
+distributed separately under the Gemma Terms of Use (https://ai.google.dev/gemma/terms), together
+with their own NOTICE.
+
+Data and assets derived from Tower-SimData and TOWER-Assets by the TOWER Benchmark contributors
+are licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).

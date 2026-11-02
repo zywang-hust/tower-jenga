@@ -1,0 +1,17 @@
+.venv/
+external/
+data/
+models/
+runs/
+submission/
+.release_notes/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+*.log
+
+.claude/worktrees/
+.python-version
